@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   Send, MessageSquare, Table, Clipboard, Play, RotateCcw, 
   Check, Loader2, Sparkles, BookOpen, Plus, Trash2, 
-  ToggleLeft, ToggleRight, X, Edit2, Cloud, AlertTriangle, Info, Settings, Save, Download, Upload, User
+  ToggleLeft, ToggleRight, X, Edit2, Cloud, AlertTriangle, Info, Settings, Save, Download, Upload, User, WifiOff
 } from 'lucide-react';
 
 // --- Firebase Imports ---
@@ -26,9 +26,11 @@ import {
 
 // --- Firebase Configuration ---
 // ⚠️ LOCAL DEPLOYMENT NOTE: 
-// If you are running this locally, replace the line below with your own config:
-// const firebaseConfig = { apiKey: "...", ... };
-const firebaseConfig = JSON.parse(__firebase_config);
+// If you are running this locally with a dummy config, the app will now automatically fallback to LocalStorage.
+// You don't need to change this unless you have a real Firebase project.
+const firebaseConfig = typeof __firebase_config !== 'undefined' 
+  ? JSON.parse(__firebase_config) 
+  : { apiKey: "dummy-key", authDomain: "dummy", projectId: "dummy" }; // Fallback for local dev without env vars
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -38,6 +40,7 @@ const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 export default function App() {
   // --- State Management ---
   const [user, setUser] = useState(null);
+  const [isOfflineMode, setIsOfflineMode] = useState(false); // New: Track offline state
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -57,14 +60,14 @@ export default function App() {
   const [editingCard, setEditingCard] = useState(null); 
   const [cardForm, setCardForm] = useState({ title: '', content: '' });
   const [isEditingCardMode, setIsEditingCardMode] = useState(false); 
-  const fileInputRef = useRef(null); // Ref for file upload
+  const fileInputRef = useRef(null); 
 
   // Settings & Model Config
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [apiConfig, setApiConfig] = useState({
-    provider: 'gemini', // 'gemini' | 'openai' | 'custom'
+    provider: 'gemini', 
     apiKey: '',
-    baseUrl: '', // For OpenAI-compatible endpoints (e.g. Ollama, DeepSeek)
+    baseUrl: '', 
     modelName: ''
   });
 
@@ -77,6 +80,7 @@ export default function App() {
   // --- Default Cards ---
   const DEFAULT_CARDS = [
     {
+      id: 'default-1',
       title: 'Excel 格式化与合并规范',
       content: [
         '在生成测试用例时，请严格遵循以下格式规范：',
@@ -88,6 +92,7 @@ export default function App() {
       createdAt: Date.now()
     },
     {
+      id: 'default-2',
       title: '通用边界值规则',
       content: [
         '在设计数值型或长度限制的输入框测试用例时，必须包含：',
@@ -103,6 +108,7 @@ export default function App() {
       createdAt: Date.now() + 1
     },
     {
+      id: 'default-3',
       title: '移动端异常场景',
       content: [
         '涉及移动端功能时，需补充以下场景：',
@@ -119,13 +125,19 @@ export default function App() {
 
   // --- Effects ---
   useEffect(() => {
-    // Load Settings from LocalStorage
+    // Load Settings
     const savedConfig = localStorage.getItem('kiwi_qa_api_config');
-    if (savedConfig) {
-      setApiConfig(JSON.parse(savedConfig));
-    }
+    if (savedConfig) setApiConfig(JSON.parse(savedConfig));
 
+    // Init Auth with Smart Fallback
     const initAuth = async () => {
+      // Check if using dummy config
+      if (firebaseConfig.apiKey === "dummy-key" || !firebaseConfig.apiKey) {
+        console.warn("⚠️ Using Dummy Config. Switching to Offline Mode.");
+        enableOfflineMode();
+        return;
+      }
+
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
@@ -133,16 +145,45 @@ export default function App() {
           await signInAnonymously(auth);
         }
       } catch (error) {
-        console.error("Auth failed:", error);
+        console.error("Auth failed, falling back to offline mode:", error);
+        enableOfflineMode();
       }
     };
+
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      if (currentUser) {
+        setUser(currentUser);
+        setIsOfflineMode(false);
+      }
+    });
     return () => unsubscribe();
   }, []);
 
+  const enableOfflineMode = () => {
+    setUser({ uid: 'local-user', isLocal: true });
+    setIsOfflineMode(true);
+  };
+
+  // --- Data Sync (Hybrid: Firestore + LocalStorage) ---
   useEffect(() => {
     if (!user) return;
+
+    // 1. Offline Mode: Sync from LocalStorage
+    if (user.isLocal) {
+      const localData = localStorage.getItem('kiwi_qa_cards');
+      if (localData) {
+        setPromptCards(JSON.parse(localData));
+      } else {
+        // Seed defaults for local user
+        setPromptCards(DEFAULT_CARDS);
+        localStorage.setItem('kiwi_qa_cards', JSON.stringify(DEFAULT_CARDS));
+      }
+      setIsLoadingCards(false);
+      return;
+    }
+
+    // 2. Online Mode: Sync from Firestore
     const cardsCollectionRef = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
     const unsubscribe = onSnapshot(cardsCollectionRef, (snapshot) => {
       if (snapshot.empty && !snapshot.metadata.fromCache) {
@@ -153,6 +194,9 @@ export default function App() {
         setPromptCards(loadedCards);
         setIsLoadingCards(false);
       }
+    }, (error) => {
+      console.error("Firestore sync error, switching to local view", error);
+      setIsLoadingCards(false);
     });
     return () => unsubscribe();
   }, [user]);
@@ -168,8 +212,10 @@ export default function App() {
     try {
       const batch = writeBatch(db);
       DEFAULT_CARDS.forEach(card => {
+        // Remove ID for new doc creation if needed, or use it as doc ID
+        const { id, ...data } = card;
         const newDocRef = doc(collectionRef);
-        batch.set(newDocRef, card);
+        batch.set(newDocRef, data);
       });
       await batch.commit();
     } catch (e) { console.error(e); }
@@ -179,35 +225,29 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // --- Helper: Save to LocalStorage ---
+  const saveToLocalStorage = (cards) => {
+    localStorage.setItem('kiwi_qa_cards', JSON.stringify(cards));
+    setPromptCards(cards);
+  };
+
   // --- Logic: Row Span Calculation ---
   const rowSpans = useMemo(() => {
     if (testCases.length === 0) return { modules: [], contents: [] };
-
     const modules = new Array(testCases.length).fill(0);
     const contents = new Array(testCases.length).fill(0);
-
-    let mStart = 0;
-    let cStart = 0;
-
+    let mStart = 0, cStart = 0;
     for (let i = 0; i < testCases.length; i++) {
       if (i > 0 && testCases[i].module !== testCases[i - 1].module) {
-        modules[mStart] = i - mStart;
-        mStart = i;
+        modules[mStart] = i - mStart; mStart = i;
       }
-      if (i === testCases.length - 1) {
-        modules[mStart] = i - mStart + 1;
-      }
-
+      if (i === testCases.length - 1) modules[mStart] = i - mStart + 1;
       const isSameModule = i > 0 && testCases[i].module === testCases[i - 1].module;
       const isSameContent = i > 0 && testCases[i].testContent === testCases[i - 1].testContent;
-      
       if (i > 0 && (!isSameModule || !isSameContent)) {
-        contents[cStart] = i - cStart;
-        cStart = i;
+        contents[cStart] = i - cStart; cStart = i;
       }
-      if (i === testCases.length - 1) {
-        contents[cStart] = i - cStart + 1;
-      }
+      if (i === testCases.length - 1) contents[cStart] = i - cStart + 1;
     }
     return { modules, contents };
   }, [testCases]);
@@ -219,40 +259,19 @@ export default function App() {
     return `\n--- ACTIVE GLOBAL CONTEXT RULES ---\n${activeCards.map((c, i) => `${i + 1}. [${c.title}]: ${c.content}`).join('\n')}\n-----------------------------------\n`;
   };
 
-  const showNotification = (message, type = 'success') => {
-    setToast({ show: true, message, type });
-  };
+  const showNotification = (message, type = 'success') => setToast({ show: true, message, type });
 
-  // --- Unified LLM Caller ---
   const callLLM = async (prompt) => {
-    // 1. Default Mode (System Gemini - No Config needed)
-    if (apiConfig.provider === 'gemini' && !apiConfig.apiKey) {
-      return await callSystemGemini(prompt);
-    }
-
-    // 2. Custom Config Mode
-    if (!apiConfig.apiKey && apiConfig.provider !== 'custom') { // Custom might use local proxy without key
-       throw new Error("请在设置中配置 API Key");
-    }
-
-    if (apiConfig.provider === 'openai' || apiConfig.provider === 'custom') {
-      return await callOpenAICompatible(prompt);
-    } else {
-      // User provided Gemini Key
-      return await callSystemGemini(prompt, apiConfig.apiKey);
-    }
+    if (apiConfig.provider === 'gemini' && !apiConfig.apiKey) return await callSystemGemini(prompt);
+    if (!apiConfig.apiKey && apiConfig.provider !== 'custom') throw new Error("请在设置中配置 API Key");
+    return (apiConfig.provider === 'openai' || apiConfig.provider === 'custom') ? await callOpenAICompatible(prompt) : await callSystemGemini(prompt, apiConfig.apiKey);
   };
 
   const callSystemGemini = async (prompt, customKey = "") => {
-    const apiKey = customKey || ""; // Fallback to system env key if empty
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-      }
-    );
+    const apiKey = customKey || "";
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    });
     if (!response.ok) throw new Error(`Gemini API Error: ${response.status}`);
     const data = await response.json();
     return data.candidates[0].content.parts[0].text;
@@ -260,28 +279,12 @@ export default function App() {
 
   const callOpenAICompatible = async (prompt) => {
     const baseUrl = apiConfig.baseUrl || "https://api.openai.com/v1";
-    const model = apiConfig.modelName || "gpt-3.5-turbo"; // Default fallback
-    
-    // Clean URL
     const url = baseUrl.endsWith('/') ? `${baseUrl}chat/completions` : `${baseUrl}/chat/completions`;
-
     const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiConfig.apiKey}`
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.7
-      }),
+      method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiConfig.apiKey}` },
+      body: JSON.stringify({ model: apiConfig.modelName || "gpt-3.5-turbo", messages: [{ role: "user", content: prompt }], temperature: 0.7 }),
     });
-
-    if (!response.ok) {
-       const err = await response.text();
-       throw new Error(`Model API Error: ${response.status} - ${err}`);
-    }
+    if (!response.ok) { const err = await response.text(); throw new Error(`Model API Error: ${response.status} - ${err}`); }
     const data = await response.json();
     return data.choices[0].message.content;
   };
@@ -292,90 +295,39 @@ export default function App() {
     setMessages(prev => [...prev, userMsg]);
     setInputValue('');
     setIsDiscussing(true);
-
     try {
       const historyText = messages.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
-      const prompt = `
-        History: ${historyText}
-        ${getActiveContext()}
-        User Input: ${inputValue}
-        
-        You are an expert QA Engineer. Discuss requirements with Kiwi.
-        PHASE 1: REQUIREMENT CLARIFICATION ONLY.
-        Focus on confirming the "Function List". Ask clarifying questions.
-        Reply in Chinese. Be concise.
-      `;
-      
+      const prompt = `History: ${historyText}\n${getActiveContext()}\nUser Input: ${inputValue}\nYou are an expert QA Engineer. Discuss requirements with Kiwi. PHASE 1: REQUIREMENT CLARIFICATION ONLY. Focus on confirming the "Function List". Reply in Chinese. Be concise.`;
       const response = await callLLM(prompt);
       setMessages(prev => [...prev, { role: 'assistant', content: response }]);
     } catch (error) {
       console.error(error);
       setMessages(prev => [...prev, { role: 'assistant', content: `连接错误: ${error.message}` }]);
-    } finally {
-      setIsDiscussing(false);
-    }
+    } finally { setIsDiscussing(false); }
   };
 
   const handleGenerateTestCases = async () => {
-    if (messages.length < 2) {
-      showNotification("请先讨论需求", "error");
-      return;
-    }
+    if (messages.length < 2) return showNotification("请先讨论需求", "error");
     setIsGenerating(true);
     setActiveTab('table');
-
     try {
       const historyText = messages.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
-      
-      const prompt = `
-        PHASE 2: DEEP THINKING & GENERATION
-        Context: ${historyText}
-        Global Rules: ${getActiveContext()}
-        
-        TASK: Generate DETAILED test cases.
-        
-        **CRITICAL FORMAT INSTRUCTION**:
-        Return ONLY a raw JSON array.
-        - Ensure strictly valid JSON syntax.
-        - Do NOT use single backslashes unless for escaping (use "\\\\" for literal backslash).
-        - Do NOT escape single quotes (e.g. use "'", NOT "\\'").
-        - Escape double quotes inside strings (e.g. use "\\"", NOT """).
-        
-        Keys: "module", "testContent", "preConditions", "testSteps" (use "\\n" for new lines), "expectedResult" (use "\\n"), "priority" (P0/P1/P2), "remarks".
-        Sort: module -> testContent.
-        Language: Chinese.
-      `;
-
+      const prompt = `PHASE 2: DEEP THINKING & GENERATION\nContext: ${historyText}\nGlobal Rules: ${getActiveContext()}\nTASK: Generate DETAILED test cases. FORMAT: JSON Array ONLY. Ensure strictly valid JSON syntax. Do NOT use single backslashes unless for escaping. Keys: "module", "testContent", "preConditions", "testSteps" (use \\n), "expectedResult" (use \\n), "priority" (P0/P1/P2), "remarks". Sort: module -> testContent. Language: Chinese.`;
       const response = await callLLM(prompt);
-      
-      // 1. Remove Markdown blocks
-      let cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim();
-      
-      // 2. Safe cleaning for common LLM JSON errors
-      cleanJson = cleanJson.replace(/\\'/g, "'");
-      
-      // Try parsing
+      let cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim().replace(/\\'/g, "'");
       try {
         setTestCases(JSON.parse(cleanJson));
         showNotification("生成完毕！");
       } catch (firstError) {
-        console.warn("JSON Parse failed, attempting auto-repair...", firstError);
-        // 3. Aggressive repair: Escape backslashes that are NOT followed by valid escape chars
+        console.warn("JSON repair...", firstError);
         const repairedJson = cleanJson.replace(/\\(?![/\\bfnrtu"])/g, "\\\\");
-        try {
-           setTestCases(JSON.parse(repairedJson));
-           showNotification("生成完毕 (已自动修复格式)！");
-        } catch (secondError) {
-           throw new Error("JSON 格式修复失败，请重试生成。");
-        }
+        setTestCases(JSON.parse(repairedJson));
+        showNotification("生成完毕 (已修复格式)！");
       }
-
     } catch (error) {
       console.error(error);
       showNotification(`生成失败: ${error.message}`, "error");
-    } finally {
-      setIsGenerating(false);
-    }
+    } finally { setIsGenerating(false); }
   };
 
   const handleSaveSettings = () => {
@@ -384,35 +336,73 @@ export default function App() {
     showNotification("设置已保存");
   };
 
-  // --- Handlers: Prompt Cards ---
+  // --- Handlers: Prompt Cards (Hybrid) ---
   const toggleCard = async (id) => {
     if (!user) return;
+    if (user.isLocal) {
+      const newCards = promptCards.map(c => c.id === id ? { ...c, isActive: !c.isActive } : c);
+      saveToLocalStorage(newCards);
+      return;
+    }
+    // Firebase
     const c = promptCards.find(x => x.id === id);
     if(c) updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards', id), { isActive: !c.isActive });
   };
+
   const handleDeleteCardClick = (id) => {
     setConfirmDialog({
-      isOpen: true,
-      title: '删除卡片',
-      message: '确定要删除此卡片吗？',
+      isOpen: true, title: '删除卡片', message: '确定要删除此卡片吗？',
       onConfirm: async () => {
-        try { await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards', id)); showNotification("卡片已删除"); }
-        catch(e) { showNotification("删除失败", "error"); }
+        if (user?.isLocal) {
+          const newCards = promptCards.filter(c => c.id !== id);
+          saveToLocalStorage(newCards);
+          showNotification("卡片已删除 (本地)");
+        } else {
+          try { await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards', id)); showNotification("卡片已删除"); }
+          catch(e) { showNotification("删除失败", "error"); }
+        }
       }
     });
   };
+
   const saveCard = async () => {
-    if (!user || !cardForm.title.trim()) return showNotification("内容必填", "error");
-    const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
+    // Validation Check - Ensuring it works for both local and cloud
+    if (!user) {
+        showNotification("用户状态异常，请刷新重试", "error");
+        return;
+    }
+    if (!cardForm.title.trim() || !cardForm.content.trim()) {
+        showNotification("标题和内容不能为空", "error");
+        return;
+    }
+
     try {
-      if (editingCard) await updateDoc(doc(col, editingCard.id), { title: cardForm.title, content: cardForm.content });
-      else await addDoc(col, { title: cardForm.title, content: cardForm.content, isActive: true, createdAt: Date.now() });
+      if (user.isLocal) {
+        // Local Storage Logic
+        let newCards;
+        if (editingCard) {
+          newCards = promptCards.map(c => c.id === editingCard.id ? { ...c, title: cardForm.title, content: cardForm.content } : c);
+          showNotification("卡片已更新 (本地)");
+        } else {
+          newCards = [...promptCards, { id: Date.now().toString(), title: cardForm.title, content: cardForm.content, isActive: true, createdAt: Date.now() }];
+          showNotification("新卡片已添加 (本地)");
+        }
+        saveToLocalStorage(newCards);
+      } else {
+        // Firebase Logic
+        const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
+        if (editingCard) await updateDoc(doc(col, editingCard.id), { title: cardForm.title, content: cardForm.content });
+        else await addDoc(col, { title: cardForm.title, content: cardForm.content, isActive: true, createdAt: Date.now() });
+        showNotification("卡片保存成功");
+      }
       setIsEditingCardMode(false);
-      showNotification("卡片保存成功");
-    } catch(e) { showNotification("保存失败", "error"); }
+    } catch(e) { 
+        console.error(e);
+        showNotification("保存失败", "error"); 
+    }
   };
 
-  // --- Handlers: Export / Import ---
+  // --- Handlers: Export / Import (Hybrid) ---
   const handleExportCards = () => {
     if (promptCards.length === 0) return showNotification("没有可导出的卡片", "error");
     const exportData = promptCards.map(({ title, content, isActive }) => ({ title, content, isActive }));
@@ -427,37 +417,46 @@ export default function App() {
     showNotification("提示词库已导出");
   };
 
-  const handleImportClick = () => {
-    fileInputRef.current?.click();
-  };
+  const handleImportClick = () => fileInputRef.current?.click();
 
   const handleImportFileChange = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = async (event) => {
       try {
         const imported = JSON.parse(event.target.result);
         if (!Array.isArray(imported)) throw new Error("格式错误");
         
-        const batch = writeBatch(db);
-        const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
-        
         let count = 0;
-        imported.forEach(card => {
-          if (card.title && card.content) {
-            const newRef = doc(col);
-            batch.set(newRef, {
-              title: card.title,
-              content: card.content,
-              isActive: card.isActive !== undefined ? card.isActive : false,
-              createdAt: Date.now() + count++
+        
+        if (user?.isLocal) {
+            // Local Import
+            const newCards = [...promptCards];
+            imported.forEach(card => {
+                if (card.title && card.content) {
+                    newCards.push({
+                        id: Date.now().toString() + Math.random(),
+                        title: card.title,
+                        content: card.content,
+                        isActive: card.isActive ?? false,
+                        createdAt: Date.now() + count++
+                    });
+                }
             });
-          }
-        });
-
-        await batch.commit();
+            saveToLocalStorage(newCards);
+        } else {
+            // Firebase Import
+            const batch = writeBatch(db);
+            const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
+            imported.forEach(card => {
+              if (card.title && card.content) {
+                const newRef = doc(col);
+                batch.set(newRef, { title: card.title, content: card.content, isActive: card.isActive ?? false, createdAt: Date.now() + count++ });
+              }
+            });
+            await batch.commit();
+        }
         showNotification(`成功导入 ${count} 条规则`);
       } catch (err) {
         console.error(err);
@@ -468,8 +467,6 @@ export default function App() {
     reader.readAsText(file);
   };
 
-
-  // --- Rich Copy ---
   const copyToClipboard = () => {
     if (testCases.length === 0) return;
     try {
@@ -523,9 +520,7 @@ export default function App() {
 
   const handleResetClick = () => {
     setConfirmDialog({
-      isOpen: true,
-      title: '清空会话',
-      message: '确定要清空会话吗？',
+      isOpen: true, title: '清空会话', message: '确定要清空会话吗？',
       onConfirm: () => {
         setMessages([{ role: 'assistant', content: '我是你的 AI 测试助手。请告诉我测试需求。' }]);
         setTestCases([]);
@@ -545,7 +540,9 @@ export default function App() {
             <h1 className="text-lg font-bold text-gray-900">智能测试用例生成器</h1>
             <div className="flex items-center gap-1 text-xs text-gray-500">
                <span>By Kiwi's Assistant</span>
-               {user && <span className="flex items-center gap-1 text-green-600 bg-green-50 px-1.5 py-0.5 rounded"><Cloud size={10}/> 云同步</span>}
+               {user && <span className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${isOfflineMode ? 'bg-gray-200 text-gray-600' : 'bg-green-50 text-green-600'}`}>
+                 {isOfflineMode ? <><WifiOff size={10}/> 本地模式</> : <><Cloud size={10}/> 云同步</>}
+               </span>}
             </div>
           </div>
         </div>
@@ -654,9 +651,13 @@ export default function App() {
               <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
                 <h4 className="text-sm font-bold text-gray-700 mb-2 flex items-center gap-1"><User size={14}/> 当前账号信息</h4>
                 <div className="text-xs text-gray-500 break-all font-mono bg-white p-2 rounded border border-gray-100">
-                  {user ? `UID: ${user.uid}` : '未登录 (离线模式)'}
+                  {user ? (user.isLocal ? '本地离线用户 (Local User)' : `UID: ${user.uid}`) : '初始化中...'}
                 </div>
-                <p className="text-[10px] text-orange-500 mt-1">⚠️ 注意：此为匿名临时账号，清空浏览器缓存会导致丢失。请务必使用“提示词库”中的【导出】功能备份数据。</p>
+                <p className="text-[10px] text-orange-500 mt-1">
+                  {isOfflineMode 
+                    ? '⚠️ 当前为本地模式，数据仅存在浏览器缓存中。请务必使用“提示词库”中的【导出】功能备份数据。' 
+                    : '✅ 已连接云端，数据自动同步。'}
+                </p>
               </div>
 
               {/* Model Config Section */}
