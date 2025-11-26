@@ -25,16 +25,11 @@ import {
 } from 'firebase/firestore';
 
 // --- Firebase Configuration ---
-//const firebaseConfig = JSON.parse(__firebase_config);
-// 本地离线模式 (虚拟配置，防止白屏)
-const firebaseConfig = {
-  apiKey: "dummy-key",
-  authDomain: "dummy.firebaseapp.com",
-  projectId: "dummy-project",
-  storageBucket: "dummy.appspot.com",
-  messagingSenderId: "000000000",
-  appId: "1:00000000:web:00000000"
-};
+// ⚠️ LOCAL DEPLOYMENT NOTE: 
+// If you are running this locally, replace the line below with your own config:
+// const firebaseConfig = { apiKey: "...", ... };
+const firebaseConfig = JSON.parse(__firebase_config);
+
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
@@ -332,7 +327,6 @@ export default function App() {
     try {
       const historyText = messages.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
       
-      // Updated prompt to explicitly handle JSON syntax issues
       const prompt = `
         PHASE 2: DEEP THINKING & GENERATION
         Context: ${historyText}
@@ -358,7 +352,6 @@ export default function App() {
       let cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim();
       
       // 2. Safe cleaning for common LLM JSON errors
-      // Fix bad escaped single quotes (which are invalid in JSON)
       cleanJson = cleanJson.replace(/\\'/g, "'");
       
       // Try parsing
@@ -367,11 +360,8 @@ export default function App() {
         showNotification("生成完毕！");
       } catch (firstError) {
         console.warn("JSON Parse failed, attempting auto-repair...", firstError);
-        
         // 3. Aggressive repair: Escape backslashes that are NOT followed by valid escape chars
-        // This regex looks for \ that is NOT followed by " \ / b f n r t u
         const repairedJson = cleanJson.replace(/\\(?![/\\bfnrtu"])/g, "\\\\");
-        
         try {
            setTestCases(JSON.parse(repairedJson));
            showNotification("生成完毕 (已自动修复格式)！");
@@ -425,8 +415,6 @@ export default function App() {
   // --- Handlers: Export / Import ---
   const handleExportCards = () => {
     if (promptCards.length === 0) return showNotification("没有可导出的卡片", "error");
-    // Remove ID and internal timestamps for cleaner export, or keep them? keeping them is fine but new import should probably get new IDs.
-    // Let's verify we only export title, content, isActive.
     const exportData = promptCards.map(({ title, content, isActive }) => ({ title, content, isActive }));
     const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -453,7 +441,6 @@ export default function App() {
         const imported = JSON.parse(event.target.result);
         if (!Array.isArray(imported)) throw new Error("格式错误");
         
-        // Batch write to Firestore
         const batch = writeBatch(db);
         const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
         
@@ -476,7 +463,6 @@ export default function App() {
         console.error(err);
         showNotification("导入失败：文件格式不正确", "error");
       }
-      // Reset input
       if(fileInputRef.current) fileInputRef.current.value = '';
     };
     reader.readAsText(file);
