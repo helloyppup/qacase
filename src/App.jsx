@@ -26,21 +26,33 @@ import {
 
 // --- Firebase Configuration ---
 // ⚠️ LOCAL DEPLOYMENT NOTE: 
-// If you are running this locally with a dummy config, the app will now automatically fallback to LocalStorage.
-// You don't need to change this unless you have a real Firebase project.
-const firebaseConfig = typeof __firebase_config !== 'undefined' 
-  ? JSON.parse(__firebase_config) 
-  : { apiKey: "dummy-key", authDomain: "dummy", projectId: "dummy" }; // Fallback for local dev without env vars
+// The app is designed to gracefully failover to LocalStorage if Firebase is not configured.
+const firebaseConfig = typeof __firebase_config !== 'undefined'
+  ? JSON.parse(__firebase_config)
+  : { apiKey: "dummy-key", authDomain: "dummy", projectId: "dummy" };
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
+const isDummyConfig = !firebaseConfig?.apiKey || firebaseConfig.apiKey === "dummy-key" || firebaseConfig.apiKey.includes("dummy");
+
+let app = null;
+let auth = null;
+let db = null;
+
+// Only initialize Firebase if a real config is provided, preventing network timeout errors
+if (!isDummyConfig) {
+  try {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  } catch (e) {
+    console.warn("Firebase initialization skipped or failed:", e);
+  }
+}
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
 export default function App() {
   // --- State Management ---
   const [user, setUser] = useState(null);
-  const [isOfflineMode, setIsOfflineMode] = useState(false); // New: Track offline state
+  const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -51,28 +63,28 @@ export default function App() {
   const [isDiscussing, setIsDiscussing] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [testCases, setTestCases] = useState([]);
-  const [activeTab, setActiveTab] = useState('chat'); 
-  
+  const [activeTab, setActiveTab] = useState('chat');
+
   // Prompt Cards
   const [isPromptModalOpen, setIsPromptModalOpen] = useState(false);
   const [promptCards, setPromptCards] = useState([]);
   const [isLoadingCards, setIsLoadingCards] = useState(true);
-  const [editingCard, setEditingCard] = useState(null); 
+  const [editingCard, setEditingCard] = useState(null);
   const [cardForm, setCardForm] = useState({ title: '', content: '' });
-  const [isEditingCardMode, setIsEditingCardMode] = useState(false); 
-  const fileInputRef = useRef(null); 
+  const [isEditingCardMode, setIsEditingCardMode] = useState(false);
+  const fileInputRef = useRef(null);
 
   // Settings & Model Config
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [apiConfig, setApiConfig] = useState({
-    provider: 'gemini', 
+    provider: 'gemini',
     apiKey: '',
-    baseUrl: '', 
+    baseUrl: '',
     modelName: ''
   });
 
   // UI States
-  const [toast, setToast] = useState({ show: false, message: '', type: 'success' }); 
+  const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
   const [confirmDialog, setConfirmDialog] = useState({ isOpen: false, title: '', message: '', onConfirm: null });
 
   const chatEndRef = useRef(null);
@@ -131,9 +143,8 @@ export default function App() {
 
     // Init Auth with Smart Fallback
     const initAuth = async () => {
-      // Check if using dummy config
-      if (firebaseConfig.apiKey === "dummy-key" || !firebaseConfig.apiKey) {
-        console.warn("⚠️ Using Dummy Config. Switching to Offline Mode.");
+      if (isDummyConfig || !auth) {
+        console.log("ℹ️ Local/Dummy Config detected. Activating Offline Mode.");
         enableOfflineMode();
         return;
       }
@@ -145,18 +156,22 @@ export default function App() {
           await signInAnonymously(auth);
         }
       } catch (error) {
-        console.error("Auth failed, falling back to offline mode:", error);
+        console.warn("⚠️ Cloud Auth failed (Offline Mode Activated):", error.message);
         enableOfflineMode();
       }
     };
 
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      if (currentUser) {
-        setUser(currentUser);
-        setIsOfflineMode(false);
-      }
-    });
+
+    let unsubscribe = () => {};
+    if (auth) {
+      unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+        if (currentUser) {
+          setUser(currentUser);
+          setIsOfflineMode(false);
+        }
+      });
+    }
     return () => unsubscribe();
   }, []);
 
@@ -169,13 +184,11 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
-    // 1. Offline Mode: Sync from LocalStorage
-    if (user.isLocal) {
+    if (user.isLocal || !db) {
       const localData = localStorage.getItem('kiwi_qa_cards');
       if (localData) {
         setPromptCards(JSON.parse(localData));
       } else {
-        // Seed defaults for local user
         setPromptCards(DEFAULT_CARDS);
         localStorage.setItem('kiwi_qa_cards', JSON.stringify(DEFAULT_CARDS));
       }
@@ -183,22 +196,26 @@ export default function App() {
       return;
     }
 
-    // 2. Online Mode: Sync from Firestore
-    const cardsCollectionRef = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
-    const unsubscribe = onSnapshot(cardsCollectionRef, (snapshot) => {
-      if (snapshot.empty && !snapshot.metadata.fromCache) {
-        seedDefaultCards(cardsCollectionRef);
-      } else {
-        const loadedCards = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        loadedCards.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-        setPromptCards(loadedCards);
+    try {
+        const cardsCollectionRef = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
+        const unsubscribe = onSnapshot(cardsCollectionRef, (snapshot) => {
+          if (snapshot.empty && !snapshot.metadata.fromCache) {
+            seedDefaultCards(cardsCollectionRef);
+          } else {
+            const loadedCards = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            loadedCards.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+            setPromptCards(loadedCards);
+            setIsLoadingCards(false);
+          }
+        }, (error) => {
+          console.warn("Firestore sync interrupted:", error.code);
+          setIsLoadingCards(false);
+        });
+        return () => unsubscribe();
+    } catch (e) {
+        console.warn("Firestore init failed:", e);
         setIsLoadingCards(false);
-      }
-    }, (error) => {
-      console.error("Firestore sync error, switching to local view", error);
-      setIsLoadingCards(false);
-    });
-    return () => unsubscribe();
+    }
   }, [user]);
 
   useEffect(() => {
@@ -209,10 +226,10 @@ export default function App() {
   }, [toast.show]);
 
   const seedDefaultCards = async (collectionRef) => {
+    if (!db) return;
     try {
       const batch = writeBatch(db);
       DEFAULT_CARDS.forEach(card => {
-        // Remove ID for new doc creation if needed, or use it as doc ID
         const { id, ...data } = card;
         const newDocRef = doc(collectionRef);
         batch.set(newDocRef, data);
@@ -225,13 +242,11 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // --- Helper: Save to LocalStorage ---
   const saveToLocalStorage = (cards) => {
     localStorage.setItem('kiwi_qa_cards', JSON.stringify(cards));
     setPromptCards(cards);
   };
 
-  // --- Logic: Row Span Calculation ---
   const rowSpans = useMemo(() => {
     if (testCases.length === 0) return { modules: [], contents: [] };
     const modules = new Array(testCases.length).fill(0);
@@ -252,7 +267,6 @@ export default function App() {
     return { modules, contents };
   }, [testCases]);
 
-  // --- Logic: Context & API ---
   const getActiveContext = () => {
     const activeCards = promptCards.filter(c => c.isActive);
     if (activeCards.length === 0) return "";
@@ -264,7 +278,7 @@ export default function App() {
   const callLLM = async (prompt) => {
     if (apiConfig.provider === 'gemini' && !apiConfig.apiKey) return await callSystemGemini(prompt);
     if (!apiConfig.apiKey && apiConfig.provider !== 'custom') throw new Error("请在设置中配置 API Key");
-    return (apiConfig.provider === 'openai' || apiConfig.provider === 'custom') ? await callOpenAICompatible(prompt) : await callSystemGemini(prompt, apiConfig.apiKey);
+    return (['openai', 'custom', 'deepseek'].includes(apiConfig.provider)) ? await callOpenAICompatible(prompt) : await callSystemGemini(prompt, apiConfig.apiKey);
   };
 
   const callSystemGemini = async (prompt, customKey = "") => {
@@ -278,11 +292,21 @@ export default function App() {
   };
 
   const callOpenAICompatible = async (prompt) => {
-    const baseUrl = apiConfig.baseUrl || "https://api.openai.com/v1";
-    const url = baseUrl.endsWith('/') ? `${baseUrl}chat/completions` : `${baseUrl}/chat/completions`;
+    let url = "";
+    let model = apiConfig.modelName;
+
+    if (apiConfig.provider === 'deepseek') {
+      url = "https://api.deepseek.com/chat/completions";
+      model = model || "deepseek-chat";
+    } else {
+      const baseUrl = (apiConfig.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, '');
+      url = `${baseUrl}/chat/completions`;
+      model = model || "gpt-3.5-turbo";
+    }
+
     const response = await fetch(url, {
       method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiConfig.apiKey}` },
-      body: JSON.stringify({ model: apiConfig.modelName || "gpt-3.5-turbo", messages: [{ role: "user", content: prompt }], temperature: 0.7 }),
+      body: JSON.stringify({ model: model, messages: [{ role: "user", content: prompt }], temperature: 0.7 }),
     });
     if (!response.ok) { const err = await response.text(); throw new Error(`Model API Error: ${response.status} - ${err}`); }
     const data = await response.json();
@@ -312,17 +336,52 @@ export default function App() {
     setActiveTab('table');
     try {
       const historyText = messages.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
-      const prompt = `PHASE 2: DEEP THINKING & GENERATION\nContext: ${historyText}\nGlobal Rules: ${getActiveContext()}\nTASK: Generate DETAILED test cases. FORMAT: JSON Array ONLY. Ensure strictly valid JSON syntax. Do NOT use single backslashes unless for escaping. Keys: "module", "testContent", "preConditions", "testSteps" (use \\n), "expectedResult" (use \\n), "priority" (P0/P1/P2), "remarks". Sort: module -> testContent. Language: Chinese.`;
+      const prompt = `
+        PHASE 2: DEEP THINKING & GENERATION
+        Context: ${historyText}
+        Global Rules: ${getActiveContext()}
+        
+        TASK: Generate DETAILED test cases.
+        
+        **CRITICAL FORMAT INSTRUCTION**:
+        1. Return ONLY a raw JSON array.
+        2. Do NOT include any conversational text, "thinking" blocks, or markdown formatting (no \`\`\`json).
+        3. Do NOT start with rules or explanations like "[Rule 1]...". Just start with "[".
+        4. Ensure strictly valid JSON syntax.
+        5. Escape double quotes inside strings (e.g. use "\\"", NOT """).
+        
+        Keys: "module", "testContent", "preConditions", "testSteps" (use "\\n" for new lines), "expectedResult" (use "\\n"), "priority" (P0/P1/P2), "remarks".
+        Sort: module -> testContent.
+        Language: Chinese.
+      `;
+
       const response = await callLLM(prompt);
-      let cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim().replace(/\\'/g, "'");
+
+      let cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim();
+
+      const jsonArrayMatch = cleanJson.match(/\[\s*\{[\s\S]*\}\s*\]/);
+
+      if (jsonArrayMatch) {
+        cleanJson = jsonArrayMatch[0];
+      } else {
+        const simpleMatch = cleanJson.match(/\[[\s\S]*\]/);
+        if (simpleMatch) cleanJson = simpleMatch[0];
+      }
+
+      cleanJson = cleanJson.replace(/\\'/g, "'");
+
       try {
         setTestCases(JSON.parse(cleanJson));
         showNotification("生成完毕！");
       } catch (firstError) {
-        console.warn("JSON repair...", firstError);
+        console.warn("JSON Parse failed, attempting auto-repair...", firstError);
         const repairedJson = cleanJson.replace(/\\(?![/\\bfnrtu"])/g, "\\\\");
-        setTestCases(JSON.parse(repairedJson));
-        showNotification("生成完毕 (已修复格式)！");
+        try {
+           setTestCases(JSON.parse(repairedJson));
+           showNotification("生成完毕 (已自动修复格式)！");
+        } catch (e) {
+           throw new Error("格式修复失败，请重试。");
+        }
       }
     } catch (error) {
       console.error(error);
@@ -336,15 +395,14 @@ export default function App() {
     showNotification("设置已保存");
   };
 
-  // --- Handlers: Prompt Cards (Hybrid) ---
+  // --- Handlers: Prompt Cards ---
   const toggleCard = async (id) => {
     if (!user) return;
-    if (user.isLocal) {
+    if (user.isLocal || !db) {
       const newCards = promptCards.map(c => c.id === id ? { ...c, isActive: !c.isActive } : c);
       saveToLocalStorage(newCards);
       return;
     }
-    // Firebase
     const c = promptCards.find(x => x.id === id);
     if(c) updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards', id), { isActive: !c.isActive });
   };
@@ -353,7 +411,7 @@ export default function App() {
     setConfirmDialog({
       isOpen: true, title: '删除卡片', message: '确定要删除此卡片吗？',
       onConfirm: async () => {
-        if (user?.isLocal) {
+        if (user?.isLocal || !db) {
           const newCards = promptCards.filter(c => c.id !== id);
           saveToLocalStorage(newCards);
           showNotification("卡片已删除 (本地)");
@@ -366,19 +424,11 @@ export default function App() {
   };
 
   const saveCard = async () => {
-    // Validation Check - Ensuring it works for both local and cloud
-    if (!user) {
-        showNotification("用户状态异常，请刷新重试", "error");
-        return;
-    }
-    if (!cardForm.title.trim() || !cardForm.content.trim()) {
-        showNotification("标题和内容不能为空", "error");
-        return;
-    }
+    if (!user) return showNotification("用户状态异常，请刷新重试", "error");
+    if (!cardForm.title.trim() || !cardForm.content.trim()) return showNotification("标题和内容不能为空", "error");
 
     try {
-      if (user.isLocal) {
-        // Local Storage Logic
+      if (user.isLocal || !db) {
         let newCards;
         if (editingCard) {
           newCards = promptCards.map(c => c.id === editingCard.id ? { ...c, title: cardForm.title, content: cardForm.content } : c);
@@ -389,20 +439,18 @@ export default function App() {
         }
         saveToLocalStorage(newCards);
       } else {
-        // Firebase Logic
         const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
         if (editingCard) await updateDoc(doc(col, editingCard.id), { title: cardForm.title, content: cardForm.content });
         else await addDoc(col, { title: cardForm.title, content: cardForm.content, isActive: true, createdAt: Date.now() });
         showNotification("卡片保存成功");
       }
       setIsEditingCardMode(false);
-    } catch(e) { 
+    } catch(e) {
         console.error(e);
-        showNotification("保存失败", "error"); 
+        showNotification("保存失败", "error");
     }
   };
 
-  // --- Handlers: Export / Import (Hybrid) ---
   const handleExportCards = () => {
     if (promptCards.length === 0) return showNotification("没有可导出的卡片", "error");
     const exportData = promptCards.map(({ title, content, isActive }) => ({ title, content, isActive }));
@@ -427,11 +475,9 @@ export default function App() {
       try {
         const imported = JSON.parse(event.target.result);
         if (!Array.isArray(imported)) throw new Error("格式错误");
-        
+
         let count = 0;
-        
-        if (user?.isLocal) {
-            // Local Import
+        if (user?.isLocal || !db) {
             const newCards = [...promptCards];
             imported.forEach(card => {
                 if (card.title && card.content) {
@@ -446,7 +492,6 @@ export default function App() {
             });
             saveToLocalStorage(newCards);
         } else {
-            // Firebase Import
             const batch = writeBatch(db);
             const col = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
             imported.forEach(card => {
@@ -645,7 +690,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl p-6">
             <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Settings size={20} className="text-gray-600"/> 系统设置</h3>
-            
+
             <div className="space-y-6">
               {/* Account Section */}
               <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
@@ -654,8 +699,8 @@ export default function App() {
                   {user ? (user.isLocal ? '本地离线用户 (Local User)' : `UID: ${user.uid}`) : '初始化中...'}
                 </div>
                 <p className="text-[10px] text-orange-500 mt-1">
-                  {isOfflineMode 
-                    ? '⚠️ 当前为本地模式，数据仅存在浏览器缓存中。请务必使用“提示词库”中的【导出】功能备份数据。' 
+                  {isOfflineMode
+                    ? '⚠️ 当前为本地模式，数据仅存在浏览器缓存中。请务必使用“提示词库”中的【导出】功能备份数据。'
                     : '✅ 已连接云端，数据自动同步。'}
                 </p>
               </div>
@@ -665,40 +710,42 @@ export default function App() {
                 <h4 className="text-sm font-bold text-gray-700">🤖 模型配置</h4>
                 <div>
                   <label className="block text-xs font-medium text-gray-500 mb-1">Provider</label>
-                  <select 
-                    value={apiConfig.provider} 
+                  <select
+                    value={apiConfig.provider}
                     onChange={e => setApiConfig({...apiConfig, provider: e.target.value})}
                     className="w-full border rounded-lg p-2 text-sm bg-white"
                   >
                     <option value="gemini">Google Gemini (Default)</option>
+                    <option value="deepseek">DeepSeek (推荐)</option>
                     <option value="openai">OpenAI / Compatible</option>
                     <option value="custom">Custom (Ollama/Local)</option>
                   </select>
                 </div>
 
+                {['openai', 'custom'].includes(apiConfig.provider) && (
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Base URL</label>
+                    <input
+                      type="text"
+                      placeholder="https://api.openai.com/v1"
+                      value={apiConfig.baseUrl}
+                      onChange={e => setApiConfig({...apiConfig, baseUrl: e.target.value})}
+                      className="w-full border rounded-lg p-2 text-sm"
+                    />
+                  </div>
+                )}
+
                 {apiConfig.provider !== 'gemini' && (
-                  <>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-500 mb-1">Base URL</label>
-                      <input 
-                        type="text" 
-                        placeholder="https://api.openai.com/v1" 
-                        value={apiConfig.baseUrl}
-                        onChange={e => setApiConfig({...apiConfig, baseUrl: e.target.value})}
-                        className="w-full border rounded-lg p-2 text-sm"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-500 mb-1">Model Name</label>
-                      <input 
-                        type="text" 
-                        placeholder="gpt-4" 
-                        value={apiConfig.modelName}
-                        onChange={e => setApiConfig({...apiConfig, modelName: e.target.value})}
-                        className="w-full border rounded-lg p-2 text-sm"
-                      />
-                    </div>
-                  </>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Model Name</label>
+                    <input
+                      type="text"
+                      placeholder={apiConfig.provider === 'deepseek' ? "deepseek-chat (留空默认) 或 deepseek-reasoner" : "gpt-4"}
+                      value={apiConfig.modelName}
+                      onChange={e => setApiConfig({...apiConfig, modelName: e.target.value})}
+                      className="w-full border rounded-lg p-2 text-sm"
+                    />
+                  </div>
                 )}
 
                 <div>
