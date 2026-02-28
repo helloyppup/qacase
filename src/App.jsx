@@ -2,31 +2,30 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   Send, MessageSquare, Table, Clipboard, Play, RotateCcw, 
   Check, Loader2, Sparkles, BookOpen, Plus, Trash2, 
-  ToggleLeft, ToggleRight, X, Edit2, Cloud, AlertTriangle, Info, Settings, Save, Download, Upload, User, WifiOff
+  ToggleLeft, ToggleRight, X, Edit2, Cloud, AlertTriangle, Info, Settings, Save, Download, Upload, User, WifiOff,
+  Paperclip, FileText, Maximize2, Minimize2
 } from 'lucide-react';
 
 // --- Firebase Imports ---
 import { initializeApp } from 'firebase/app';
-import { 
-  getAuth, 
-  signInAnonymously, 
+import {
+  getAuth,
+  signInAnonymously,
   signInWithCustomToken,
-  onAuthStateChanged 
+  onAuthStateChanged
 } from 'firebase/auth';
-import { 
-  getFirestore, 
-  collection, 
-  doc, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  onSnapshot, 
+import {
+  getFirestore,
+  collection,
+  doc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
   writeBatch
 } from 'firebase/firestore';
 
 // --- Firebase Configuration ---
-// ⚠️ LOCAL DEPLOYMENT NOTE: 
-// The app is designed to gracefully failover to LocalStorage if Firebase is not configured.
 const firebaseConfig = typeof __firebase_config !== 'undefined'
   ? JSON.parse(__firebase_config)
   : { apiKey: "dummy-key", authDomain: "dummy", projectId: "dummy" };
@@ -37,7 +36,6 @@ let app = null;
 let auth = null;
 let db = null;
 
-// Only initialize Firebase if a real config is provided, preventing network timeout errors
 if (!isDummyConfig) {
   try {
     app = initializeApp(firebaseConfig);
@@ -49,14 +47,28 @@ if (!isDummyConfig) {
 }
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
+// --- Utility: Load External Scripts for File Parsing ---
+const loadScript = (src) => {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+};
+
 export default function App() {
   // --- State Management ---
   const [user, setUser] = useState(null);
   const [isOfflineMode, setIsOfflineMode] = useState(false);
+  const [isChatFullScreen, setIsChatFullScreen] = useState(false); // 新增全屏状态
+
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
-      content: '你好 Kiwi！我是你的 AI 测试助手。\n\n我们将分两步工作：\n1. **功能讨论**：你告诉我大概要测什么，我们先确定功能列表。\n2. **生成用例**：确认功能后，点击生成，我会自动为你补充详细步骤和异常场景。'
+      content: '你好！我是你的 AI 测试助手。\n\n我们将分两步工作：\n1. **功能讨论**：你告诉我大概要测什么，上传文档会注入全局上下文。\n2. **生成用例**：确认功能后，点击生成，我会自动为你补充详细步骤和异常场景。'
     }
   ]);
   const [inputValue, setInputValue] = useState('');
@@ -73,6 +85,10 @@ export default function App() {
   const [cardForm, setCardForm] = useState({ title: '', content: '' });
   const [isEditingCardMode, setIsEditingCardMode] = useState(false);
   const fileInputRef = useRef(null);
+  const docFileInputRef = useRef(null);
+
+  // Attached Documents
+  const [attachedFiles, setAttachedFiles] = useState([]);
 
   // Settings & Model Config
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -105,50 +121,31 @@ export default function App() {
     },
     {
       id: 'default-2',
-      title: '通用边界值规则',
+      title: '物联网设备通用异常',
       content: [
-        '在设计数值型或长度限制的输入框测试用例时，必须包含：',
-        '- 最小值-1',
-        '- 最小值',
-        '- 最大值',
-        '- 最大值+1',
-        '- 空值',
-        '- 非数字/特殊字符',
-        '- 超长字符'
+        '在设计设备相关测试用例时，必须包含：',
+        '- 弱网/断网/网络频繁切换状态下的表现',
+        '- 设备断电重启后的状态恢复',
+        '- 丢包/乱序/重复报文处理',
+        '- 协议边界值（如超长指令、非法格式）',
+        '- 并发指令冲突处理'
       ].join('\n'),
       isActive: false,
       createdAt: Date.now() + 1
-    },
-    {
-      id: 'default-3',
-      title: '移动端异常场景',
-      content: [
-        '涉及移动端功能时，需补充以下场景：',
-        '- 弱网/断网状态下的表现',
-        '- 飞行模式切换',
-        '- 应用后台切换/杀进程',
-        '- 来电/短信中断',
-        '- 低电量/省电模式提醒'
-      ].join('\n'),
-      isActive: false,
-      createdAt: Date.now() + 2
     }
   ];
 
   // --- Effects ---
   useEffect(() => {
-    // Load Settings
     const savedConfig = localStorage.getItem('kiwi_qa_api_config');
     if (savedConfig) setApiConfig(JSON.parse(savedConfig));
 
-    // Init Auth with Smart Fallback
     const initAuth = async () => {
       if (isDummyConfig || !auth) {
         console.log("ℹ️ Local/Dummy Config detected. Activating Offline Mode.");
         enableOfflineMode();
         return;
       }
-
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
@@ -162,7 +159,6 @@ export default function App() {
     };
 
     initAuth();
-
     let unsubscribe = () => {};
     if (auth) {
       unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -180,10 +176,9 @@ export default function App() {
     setIsOfflineMode(true);
   };
 
-  // --- Data Sync (Hybrid: Firestore + LocalStorage) ---
+  // --- Data Sync ---
   useEffect(() => {
     if (!user) return;
-
     if (user.isLocal || !db) {
       const localData = localStorage.getItem('kiwi_qa_cards');
       if (localData) {
@@ -195,7 +190,6 @@ export default function App() {
       setIsLoadingCards(false);
       return;
     }
-
     try {
         const cardsCollectionRef = collection(db, 'artifacts', appId, 'users', user.uid, 'prompt_cards');
         const unsubscribe = onSnapshot(cardsCollectionRef, (snapshot) => {
@@ -247,6 +241,73 @@ export default function App() {
     setPromptCards(cards);
   };
 
+  // --- Document Parsing ---
+  const parsePDF = async (file) => {
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+    const pdfjsLib = window['pdfjs-dist/build/pdf'];
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let text = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const strings = content.items.map(item => item.str);
+      text += strings.join(' ') + '\n';
+      if (text.length > 300000) {
+        text += "\n\n[提示：文档过长，为保证模型性能已截断尾部内容。]";
+        break;
+      }
+    }
+    return text;
+  };
+
+  const parseWord = async (file) => {
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js');
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await window.mammoth.extractRawText({ arrayBuffer });
+    let text = result.value;
+    if (text.length > 300000) {
+      text = text.substring(0, 300000) + "\n\n[提示：文档过长，为保证模型性能已截断尾部内容。]";
+    }
+    return text;
+  };
+
+  const handleDocFileChange = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+
+    for (const file of files) {
+      const fileId = Date.now().toString() + file.name;
+      setAttachedFiles(prev => [...prev, { id: fileId, name: file.name, text: '', isParsing: true }]);
+
+      try {
+        let extractedText = '';
+        const lowerName = file.name.toLowerCase();
+
+        if (lowerName.endsWith('.pdf')) {
+          extractedText = await parsePDF(file);
+        } else if (lowerName.endsWith('.docx')) {
+          extractedText = await parseWord(file);
+        } else if (file.type.startsWith('text/') || lowerName.endsWith('.md') || lowerName.endsWith('.json')) {
+          extractedText = await file.text();
+        } else {
+          throw new Error("不支持的格式，请上传 PDF、DOCX 或 TXT");
+        }
+
+        setAttachedFiles(prev => prev.map(f => f.id === fileId ? { ...f, text: extractedText, isParsing: false } : f));
+        showNotification(`文档《${file.name}》解析成功！`);
+      } catch (err) {
+        console.error(err);
+        setAttachedFiles(prev => prev.filter(f => f.id !== fileId));
+        showNotification(`解析《${file.name}》失败: ${err.message}`, "error");
+      }
+    }
+    if (docFileInputRef.current) docFileInputRef.current.value = '';
+  };
+
+
   const rowSpans = useMemo(() => {
     if (testCases.length === 0) return { modules: [], contents: [] };
     const modules = new Array(testCases.length).fill(0);
@@ -269,8 +330,19 @@ export default function App() {
 
   const getActiveContext = () => {
     const activeCards = promptCards.filter(c => c.isActive);
-    if (activeCards.length === 0) return "";
-    return `\n--- ACTIVE GLOBAL CONTEXT RULES ---\n${activeCards.map((c, i) => `${i + 1}. [${c.title}]: ${c.content}`).join('\n')}\n-----------------------------------\n`;
+    let contextStr = "";
+
+    if (activeCards.length > 0) {
+      contextStr += `\n--- ACTIVE GLOBAL CONTEXT RULES ---\n${activeCards.map((c, i) => `${i + 1}. [${c.title}]: ${c.content}`).join('\n')}\n-----------------------------------\n`;
+    }
+
+    if (attachedFiles.length > 0) {
+      contextStr += `\n--- ATTACHED PROTOCOL/REQUIREMENT DOCUMENTS ---\n下面是用户上传的设备文档，请在设计用例和解答问题时作为重要依据：\n`;
+      contextStr += attachedFiles.map(f => `【文档名称: ${f.name}】\n${f.text}`).join('\n\n');
+      contextStr += `\n-----------------------------------\n`;
+    }
+
+    return contextStr;
   };
 
   const showNotification = (message, type = 'success') => setToast({ show: true, message, type });
@@ -321,7 +393,7 @@ export default function App() {
     setIsDiscussing(true);
     try {
       const historyText = messages.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
-      const prompt = `History: ${historyText}\n${getActiveContext()}\nUser Input: ${inputValue}\nYou are an expert QA Engineer. Discuss requirements with Kiwi. PHASE 1: REQUIREMENT CLARIFICATION ONLY. Focus on confirming the "Function List". Reply in Chinese. Be concise.`;
+      const prompt = `History: ${historyText}\n${getActiveContext()}\nUser Input: ${inputValue}\nYou are an expert QA Engineer. Discuss requirements with Kiwi. PHASE 1: REQUIREMENT CLARIFICATION ONLY. Focus on confirming the "Function List" and analyzing any provided protocol documents. Reply in Chinese. Be concise.`;
       const response = await callLLM(prompt);
       setMessages(prev => [...prev, { role: 'assistant', content: response }]);
     } catch (error) {
@@ -331,9 +403,10 @@ export default function App() {
   };
 
   const handleGenerateTestCases = async () => {
-    if (messages.length < 2) return showNotification("请先讨论需求", "error");
+    if (messages.length < 2 && attachedFiles.length === 0) return showNotification("请先提供需求或协议文档", "error");
     setIsGenerating(true);
     setActiveTab('table');
+    setIsChatFullScreen(false); // 生成时自动收起全屏，展示表格
     try {
       const historyText = messages.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
       const prompt = `
@@ -341,7 +414,7 @@ export default function App() {
         Context: ${historyText}
         Global Rules: ${getActiveContext()}
         
-        TASK: Generate DETAILED test cases.
+        TASK: Generate DETAILED test cases based on the discussion and any attached protocol documents.
         
         **CRITICAL FORMAT INSTRUCTION**:
         1. Return ONLY a raw JSON array.
@@ -358,7 +431,6 @@ export default function App() {
       const response = await callLLM(prompt);
 
       let cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim();
-
       const jsonArrayMatch = cleanJson.match(/\[\s*\{[\s\S]*\}\s*\]/);
 
       if (jsonArrayMatch) {
@@ -565,11 +637,13 @@ export default function App() {
 
   const handleResetClick = () => {
     setConfirmDialog({
-      isOpen: true, title: '清空会话', message: '确定要清空会话吗？',
+      isOpen: true, title: '清空会话', message: '确定要清空会话及已上传的附件吗？',
       onConfirm: () => {
-        setMessages([{ role: 'assistant', content: '我是你的 AI 测试助手。请告诉我测试需求。' }]);
+        setMessages([{ role: 'assistant', content: '我是你的 AI 测试助手。\n\n我们分两步走：\n1. 先讨论功能列表（或者上传文档）。\n2. 再点击生成，我会为你补充详细用例。' }]);
         setTestCases([]);
+        setAttachedFiles([]); // Clear attachments on reset
         setActiveTab('chat');
+        setIsChatFullScreen(false);
         showNotification("已重置");
       }
     });
@@ -578,7 +652,7 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen bg-gray-50 font-sans text-gray-800">
       {/* Header */}
-      <header className="bg-white border-b border-gray-200 px-4 py-3 md:px-6 md:py-4 flex items-center justify-between shadow-sm z-10">
+      <header className="bg-white border-b border-gray-200 px-4 py-3 md:px-6 md:py-4 flex items-center justify-between shadow-sm z-10 shrink-0">
         <div className="flex items-center gap-2">
           <div className="bg-purple-600 p-2 rounded-lg text-white"><Sparkles size={20} /></div>
           <div>
@@ -604,7 +678,30 @@ export default function App() {
       {/* Main */}
       <main className="flex-1 flex overflow-hidden relative">
         {/* Chat Panel */}
-        <div className={`flex-1 flex flex-col bg-white border-r border-gray-200 transition-all duration-300 ${activeTab === 'table' ? 'hidden md:flex md:w-1/3 md:flex-none' : 'w-full'}`}>
+        <div className={`bg-white border-r border-gray-200 transition-all duration-300 flex flex-col relative z-20 
+          ${activeTab === 'table' ? 'hidden md:flex' : 'flex flex-1 w-full'} 
+          ${isChatFullScreen ? 'md:w-full md:flex-1' : 'md:w-1/3 md:flex-none'}
+        `}>
+
+          {/* Chat Header (New) */}
+          <div className="bg-white border-b border-gray-200 p-3 flex justify-between items-center shadow-sm shrink-0">
+             <div className="flex items-center gap-2">
+               <h2 className="font-semibold text-gray-700 flex items-center gap-2"><MessageSquare size={18} className="text-purple-600"/> 需求沟通</h2>
+             </div>
+             <div className="flex gap-2">
+                <button onClick={() => setActiveTab('table')} className="md:hidden p-1.5 text-gray-500 hover:bg-gray-100 rounded-md transition" title="查看表格">
+                  <Table size={18}/>
+                </button>
+                <button
+                  onClick={() => setIsChatFullScreen(!isChatFullScreen)}
+                  className="hidden md:flex p-1.5 text-gray-500 hover:bg-gray-100 rounded-md transition"
+                  title={isChatFullScreen ? "收起面板" : "全屏扩展"}
+                >
+                  {isChatFullScreen ? <Minimize2 size={18}/> : <Maximize2 size={18}/>}
+                </button>
+             </div>
+          </div>
+
           <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
              {!isLoadingCards && promptCards.some(c => c.isActive) && (
                <div className="flex justify-center mb-2">
@@ -623,24 +720,62 @@ export default function App() {
             {isDiscussing && <div className="flex justify-start"><div className="bg-white border p-3 rounded-2xl rounded-bl-none"><Loader2 className="animate-spin text-purple-600" size={16} /></div></div>}
             <div ref={chatEndRef} />
           </div>
-          <div className="p-4 bg-white border-t border-gray-200">
+
+          <div className="p-4 bg-white border-t border-gray-200 shrink-0">
+            {/* Attached Files Display */}
+            {attachedFiles.length > 0 && (
+              <div className="flex flex-wrap gap-2 mb-3 p-2 bg-gray-50 rounded-lg border border-gray-200 max-h-24 overflow-y-auto">
+                {attachedFiles.map(f => (
+                  <div key={f.id} className="flex items-center gap-1 bg-white px-2 py-1 rounded border border-gray-300 text-xs text-gray-700 shadow-sm">
+                    {f.isParsing ? <Loader2 size={12} className="animate-spin text-purple-600" /> : <FileText size={12} className="text-purple-600"/>}
+                    <span className="max-w-[120px] truncate" title={f.name}>{f.name}</span>
+                    {!f.isParsing && (
+                      <button onClick={() => setAttachedFiles(prev => prev.filter(x => x.id !== f.id))} className="text-gray-400 hover:text-red-500 ml-1">
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="relative">
-              <textarea value={inputValue} onChange={(e) => setInputValue(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSendMessage())} placeholder="描述你的测试需求..." className="w-full pr-12 pl-4 py-3 bg-gray-50 border border-gray-300 rounded-xl focus:ring-2 focus:ring-purple-500 outline-none resize-none text-sm h-24" />
-              <button onClick={handleSendMessage} disabled={!inputValue.trim() || isDiscussing} className="absolute right-3 bottom-3 p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50"><Send size={16} /></button>
+              <textarea
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSendMessage())}
+                placeholder="描述测试需求，或上传文档..."
+                className="w-full pl-12 pr-12 py-3 bg-gray-50 border border-gray-300 rounded-xl focus:ring-2 focus:ring-purple-500 outline-none resize-none text-sm h-24"
+              />
+
+              <button onClick={() => docFileInputRef.current?.click()} className="absolute left-3 bottom-3 p-2 text-gray-500 hover:bg-gray-200 hover:text-purple-600 rounded-lg transition" title="上传文档 (PDF/Word/TXT)">
+                 <Paperclip size={18} />
+              </button>
+              <input type="file" multiple ref={docFileInputRef} onChange={handleDocFileChange} accept=".pdf,.doc,.docx,.txt,.md,.json" className="hidden" />
+
+              <button onClick={handleSendMessage} disabled={!inputValue.trim() || isDiscussing || attachedFiles.some(f => f.isParsing)} className="absolute right-3 bottom-3 p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50"><Send size={16} /></button>
             </div>
-            <div className="mt-3 flex justify-between"><p className="text-xs text-gray-400">Step 1：讨论功能范围。</p><button onClick={handleGenerateTestCases} disabled={isGenerating || messages.length < 2} className="md:hidden flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm shadow-md">{isGenerating ? <Loader2 size={16}/> : <Play size={16} />} 生成</button></div>
+            <div className="mt-3 flex justify-between">
+              <p className="text-xs text-gray-400">Step 1：讨论功能与协议范围。</p>
+              <button onClick={handleGenerateTestCases} disabled={isGenerating || (messages.length < 2 && attachedFiles.length === 0)} className="md:hidden flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm shadow-md">
+                {isGenerating ? <Loader2 size={16}/> : <Play size={16} />} 生成
+              </button>
+            </div>
           </div>
         </div>
 
         {/* Table Panel */}
-        <div className={`flex-[2] bg-gray-100 flex flex-col overflow-hidden ${activeTab === 'chat' ? 'hidden md:flex' : 'flex'}`}>
-          <div className="bg-white border-b border-gray-200 p-3 flex justify-between shadow-sm">
+        <div className={`bg-gray-100 flex flex-col overflow-hidden transition-all duration-300 
+          ${activeTab === 'chat' ? 'hidden md:flex' : 'flex flex-1 w-full'} 
+          ${isChatFullScreen ? 'md:hidden' : 'md:flex-[2]'}
+        `}>
+          <div className="bg-white border-b border-gray-200 p-3 flex justify-between shadow-sm shrink-0">
              <div className="flex items-center gap-2">
                <button onClick={() => setActiveTab('chat')} className="md:hidden p-2 text-gray-600"><MessageSquare size={20}/></button>
                <h2 className="font-semibold text-gray-700 flex items-center gap-2"><Table size={18} className="text-purple-600"/> 生成结果</h2>
              </div>
              <div className="flex gap-2">
-                <button onClick={handleGenerateTestCases} disabled={isGenerating || messages.length < 2} className="hidden md:flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-green-700 shadow-sm">{isGenerating ? <Loader2 className="animate-spin" size={16}/> : <Play size={16} />} 生成用例</button>
+                <button onClick={handleGenerateTestCases} disabled={isGenerating || (messages.length < 2 && attachedFiles.length === 0)} className="hidden md:flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-green-700 shadow-sm">{isGenerating ? <Loader2 className="animate-spin" size={16}/> : <Play size={16} />} 生成用例</button>
                <button onClick={copyToClipboard} disabled={testCases.length === 0} className="flex items-center gap-2 bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-50 shadow-sm"><Clipboard size={16} /> 复制到 Excel</button>
              </div>
           </div>
